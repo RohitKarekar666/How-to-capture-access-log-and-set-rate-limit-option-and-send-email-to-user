@@ -1,0 +1,28 @@
+Now login to node and enable HTTP Access logs
+•	Open command prompt / terminal
+•	Locate server.xml
+Example paths:
+Linux: /opt/atlassian/jira/conf/server.xml 
+Windows: C:\Atlassian\Jira\conf\server.xml
+•	Sudo nano server.xml
+•	Now add or uncomment the following:
+<Valve className="org.apache.catalina.valves.AccessLogValve"
+       directory="logs"
+       prefix="jira_access_log"
+       suffix=".log"
+       pattern="%h %l %u %t &quot;%r&quot; %s %b"
+       resolveHosts="false" />
+•	For better security auditing use this enhanced pattern
+pattern="%h %l %u %t &quot;%r&quot; %s %b %{User-Agent}i"
+•	Now to save press ctrl + O and to exit ctrl + X
+•	Now restart the node using below command
+  <JIRA_INSTALL>/bin/stop-jira.sh
+  <JIRA_INSTALL>/bin/start-jira.sh
+•	Now the access log will be written to: 
+  <JIRA_INSTALL>/logs/jira_access_log.YYYY-MM-DD.log
+•	Just verify the file logging is working or not (Audit proof)
+  ls -lh <JIRA_INSTALL>/logs/jira_access_log*
+•	You have to follow these steps on each node.
+•	Now just open jira in a browser and login
+•	Browse some issue
+•	Now these information will be present in the access log
