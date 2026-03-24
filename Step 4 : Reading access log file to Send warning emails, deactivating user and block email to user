@@ -1,0 +1,321 @@
+Script A - Ingest & Enforce (Scheduled Job on every node)
+•	Go to Jira admin settings
+•	Click on script runner
+•	Now click on jobs
+•	Now click on create jobs
+•	Now select custom scheduled job
+•	Give the name as WFH RL Ingest & Enforce
+•	Interval/Cron expression (Schedule) : 0 */2 * * * ? (every 2 minutes)
+•	Add the below script
+/**
+ * WFRL Ingest & Enforce (cluster-safe)
+ * - Parses Tomcat HTTP access logs on THIS node
+ * - Uses REAL log timestamps to count /rest/* requests per user in:
+ *     • 10 minutes (warn≥500, block≥700 → 1h)
+ *     • 1 hour   (warn≥1000, block≥2000 → 8h)
+ *     • 24 hours (warn≥15000, block≥20000 → 24h)
+ * - Sends warning emails and block emails
+ * - Deactivates users (internal/delegated dir) and schedules unblock time
+ *
+ * Jira DC 8/9, ScriptRunner 7.x+.
+ */
+
+import groovy.transform.Field
+import java.nio.file.*
+import java.nio.charset.StandardCharsets
+import java.time.*
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+import java.util.regex.Pattern
+import java.text.SimpleDateFormat
+import java.util.ArrayList
+
+import com.atlassian.jira.component.ComponentAccessor
+import com.atlassian.jira.user.util.UserManager
+import com.atlassian.jira.bc.user.UserService
+import com.atlassian.crowd.embedded.impl.ImmutableUser
+import com.atlassian.jira.user.ApplicationUsers
+import com.atlassian.jira.user.ApplicationUser
+import com.atlassian.jira.security.groups.GroupManager
+import com.atlassian.mail.Email
+import com.atlassian.mail.server.SMTPMailServer
+import com.atlassian.sal.api.pluginsettings.PluginSettingsFactory
+import com.atlassian.sal.api.pluginsettings.PluginSettings
+import com.atlassian.jira.cluster.ClusterManager   // correct DC API for node id
+
+/********** CONFIG (edit as needed) **********/
+@Field final String NAMESPACE = "wfrl"
+@Field final String EXEMPT_GROUP = "wfrl-exempt"  // group exempt from warnings/blocks; create it and add service accounts
+
+@Field final boolean COUNT_ONLY_REST = true       // only count requests whose path begins with /rest/
+
+// Policy thresholds & block durations
+@Field final int  WARN_10M = 500
+@Field final int  BLOCK_10M = 700
+@Field final long BLOCK_10M_DURATION = 1L * 60 * 60 * 1000   // 1 hour
+
+@Field final int  WARN_1H = 1000
+@Field final int  BLOCK_1H = 2000
+@Field final long BLOCK_1H_DURATION = 8L * 60 * 60 * 1000    // 8 hours
+
+@Field final int  WARN_1D = 15000
+@Field final int  BLOCK_1D = 20000
+@Field final long BLOCK_1D_DURATION = 24L * 60 * 60 * 1000   // 24 hours
+
+// Email subjects (body text is below)
+@Field final String SUBJECT_WARN  = "Jira API usage warning"
+@Field final String SUBJECT_BLOCK = "Jira account temporarily suspended due to excessive API usage"
+/******** END CONFIG ********/
+
+// --- constants (safe as @Field) ---
+@Field final DateTimeFormatter TS_FMT = DateTimeFormatter.ofPattern("dd/MMM/yyyy:HH:mm:ss Z", Locale.ENGLISH)
+// Tomcat access log pattern (from Atlassian KB): captures username, timestamp, path, status
+@Field final Pattern LINE_RE = Pattern.compile(
+  /^[\d\.:a-fA-F]+ \S+ (\S+) \[([^\]]+)\] "\S+ (\S+)[^"]*" (\d{3}) .*/
+)
+
+// --- component lookups ---
+def userManager  = ComponentAccessor.getUserManager() as UserManager
+def groupManager = ComponentAccessor.getGroupManager() as GroupManager
+def userService  = ComponentAccessor.getComponent(UserService)
+def mailServer   = ComponentAccessor.getMailServerManager()?.getDefaultSMTPMailServer() as SMTPMailServer
+def psf          = ComponentAccessor.getOSGiComponentInstanceOfType(PluginSettingsFactory)
+assert psf : "PluginSettingsFactory not available"
+PluginSettings settings = psf.createGlobalSettings()
+
+/** Resolve current node id on-demand from ClusterManager (correct Jira DC API) */
+String currentNodeId() {
+    def cm = ComponentAccessor.getComponent(ClusterManager)
+    return cm?.getNodeId() ?: "single-node"
+}
+
+/** Global keys (DB-backed, cluster-visible) */
+String key(String s)     { "${NAMESPACE}:${s}" }
+/** Per-node keys (use *actual* node id; safe for static checker) */
+String nodeKey(String s) { "${NAMESPACE}:node:${currentNodeId()}:${s}" }
+
+/** JSON helpers — pass 'settings' in to avoid static-scope errors */
+Map readMap(PluginSettings settings, String k) {
+    def raw = settings.get(k) as String
+    raw ? (new groovy.json.JsonSlurper().parseText(raw) as Map) : [:]
+}
+void writeMap(PluginSettings settings, String k, Map v) {
+    settings.put(k, groovy.json.JsonOutput.toJson(v))
+}
+
+// Persistent structures
+def counters = readMap(settings, key("counters"))     // username -> [ts:[epochMs...]]   (we keep ≤24h)
+def warnings = readMap(settings, key("warnings"))     // username -> [warn10mAt, warn1hAt, warn1dAt]
+def blocks   = readMap(settings, key("blocks"))       // username -> [blockedUntil, reason, since]
+def offsets  = readMap(settings, nodeKey("offsets"))  // per-node file offsets: filePath -> lastByteRead (long)
+
+/** Build list of access log paths for "today" and "yesterday" (rotation-safe) WITHOUT GStrings. */
+List<String> buildAccessLogPaths() {
+    String install = System.getenv("JIRA_INSTALL") ?: "/opt/atlassian/jira"
+    String home    = System.getenv("JIRA_HOME")    ?: "/var/atlassian/application-data/jira"
+    Date   today   = new Date()
+    Date   yday    = new Date(System.currentTimeMillis() - 86400000L)
+    SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH)
+    String todayStr = sdf.format(today)
+    String ydayStr  = sdf.format(yday)
+
+    List<String> list = new ArrayList<>()
+    list.add(install + "/logs/access_log." + todayStr)
+    list.add(install + "/logs/access_log." + ydayStr)
+    // If you enabled Jira's own HTTP access log, uncomment:
+    // list.add(home + "/log/atlassian-jira-http-access.log")
+    return list
+}
+
+// Parse timestamp like: 04/Feb/2022:10:54:12 -0300
+long parseTs(String tsText) {
+    return ZonedDateTime.parse(tsText, TS_FMT).toInstant().toEpochMilli()
+}
+
+// Record a timestamp for a user
+void recordTs(Map counters, String uname, long ts) {
+    def u = counters[uname] as Map ?: [ts: []]
+    (u.ts as List).add(ts)
+    counters[uname] = u
+}
+
+// Keep only timestamps >= cutoff
+void compact(Map counters, String uname, long cutoff) {
+    def u = counters[uname] as Map; if (!u) return
+    u.ts = (u.ts as List<Long>).findAll { it >= cutoff }
+    counters[uname] = u
+}
+
+// Count timestamps >= since  (return long to satisfy static checking)
+long countSince(Map counters, String uname, long since) {
+    def u = counters[uname] as Map; if (!u) return 0L
+    Number n = (u.ts as List<Long>).count { it >= since }
+    return n.longValue()
+}
+
+void sendMail(SMTPMailServer mailServer, String to, String subject, String body) {
+    if (!to) return
+    if (!mailServer) { log.warn("No SMTP configured; would send to ${to}: ${subject}"); return }
+    def email = new Email(to)
+    email.setSubject(subject)
+    email.setMimeType("text/plain; charset=UTF-8")
+    email.setBody(body)
+    mailServer.send(email)
+}
+
+boolean deactivateUser(UserService userService, ApplicationUser au) {
+    def immutable = new ImmutableUser(au.directoryId, au.name, au.displayName, au.emailAddress, false)
+    def updated   = ApplicationUsers.from(immutable)
+    def v = userService.validateUpdateUser(updated)
+    if (v.isValid()) { userService.updateUser(v); return true }
+    log.warn("Deactivate failed for ${au.name}: ${v.errorCollection}")
+    return false
+}
+
+boolean isExempt(GroupManager groupManager, ApplicationUser au, String exemptGroup) {
+    if (!au) return true
+    if (!au.isActive()) return true              // already inactive/blocked
+    if (exemptGroup && groupManager.isUserInGroup(au, exemptGroup)) return true
+    return false
+}
+
+// --- Compute rolling windows (do this at each run) ---
+final long now  = System.currentTimeMillis()
+final long W10M = now - 10L * 60 * 1000
+final long W1H  = now - 60L * 60 * 1000
+final long W1D  = now - 24L * 60 * 60 * 1000
+
+// --- Ingest new log lines from this node ---
+int ingested = 0
+buildAccessLogPaths().each { pathStr ->
+    try {
+        def path = Paths.get(pathStr)
+        if (!Files.exists(path)) return
+        def raf = new RandomAccessFile(path.toFile(), "r")
+        long last = (offsets[pathStr] as Long) ?: 0L
+        if (last > raf.length()) last = 0L // rotated/truncated
+        raf.seek(last)
+        String raw
+        while ((raw = raf.readLine()) != null) {
+            String line = new String(raw.getBytes("ISO-8859-1"), StandardCharsets.UTF_8)
+            def m = LINE_RE.matcher(line)
+            if (!m.matches()) continue
+            String uname   = m.group(1)
+            String tsText  = m.group(2)
+            String pathPart= m.group(3)
+            // int status = (m.group(4) as int) // not needed for counting
+
+            if (uname == "-") continue
+            if (COUNT_ONLY_REST && !pathPart.startsWith("/rest/")) continue
+
+            long ts = parseTs(tsText)
+            if (ts >= W1D) {                      // only keep last 24h data
+                recordTs(counters, uname, ts)
+                ingested++
+            }
+        }
+        offsets[pathStr] = raf.getFilePointer()
+        raf.close()
+    } catch (Throwable t) {
+        log.warn("Error reading ${pathStr}: ${t.message}")
+    }
+}
+
+// --- Enforce policy ---
+def nowDate = new Date(now)
+(counters.keySet() as Set<String>).toList().each { uname ->
+    // Keep only last 24h of timestamps
+    compact(counters, uname, W1D)
+
+    def au = userManager.getUserByName(uname) as ApplicationUser
+    if (!au || isExempt(groupManager, au, EXEMPT_GROUP)) return
+
+    // Skip if already blocked; auto-unblock job handles re-activation
+    if (blocks[uname]) return
+
+    long c10 = countSince(counters, uname, W10M)
+    long c1h = countSince(counters, uname, W1H)
+    long c1d = countSince(counters, uname, W1D)
+
+    // Warnings (send once per window crossing)
+    def w = (warnings[uname] as Map) ?: [:]
+    if (c10 >= WARN_10M && !w.warn10mAt) {
+        sendMail(mailServer, au.emailAddress, SUBJECT_WARN,
+"""Hello ${au.displayName},
+
+You have exceeded the API request warning threshold (${WARN_10M}) within 10 minutes.
+Current usage (10m): ${c10}.
+
+Please reduce request rates to avoid temporary suspension.
+
+Regards,
+Jira Admin Team
+""")
+        w.warn10mAt = now
+    }
+    if (c1h >= WARN_1H && !w.warn1hAt) {
+        sendMail(mailServer, au.emailAddress, SUBJECT_WARN,
+"""Hello ${au.displayName},
+
+You have exceeded the API request warning threshold (${WARN_1H}) within 1 hour.
+Current usage (1h): ${c1h}.
+
+Please reduce request rates to avoid temporary suspension.
+
+Regards,
+Jira Admin Team
+""")
+        w.warn1hAt = now
+    }
+    if (c1d >= WARN_1D && !w.warn1dAt) {
+        sendMail(mailServer, au.emailAddress, SUBJECT_WARN,
+"""Hello ${au.displayName},
+
+You have exceeded the API request warning threshold (${WARN_1D}) within 24 hours.
+Current usage (24h): ${c1d}.
+
+Please reduce request rates to avoid temporary suspension.
+
+Regards,
+Jira Admin Team
+""")
+        w.warn1dAt = now
+    }
+    warnings[uname] = w
+
+    // Blocking precedence: Day > Hour > 10m (apply the longest applicable)
+    long duration = 0L; String reason = null
+    if      (c1d >= BLOCK_1D)  { duration = BLOCK_1D_DURATION; reason = "DAILY_${BLOCK_1D}" }
+    else if (c1h >= BLOCK_1H)  { duration = BLOCK_1H_DURATION; reason = "HOURLY_${BLOCK_1H}" }
+    else if (c10 >= BLOCK_10M) { duration = BLOCK_10M_DURATION; reason = "TENMIN_${BLOCK_10M}" }
+
+    if (duration > 0L) {
+        long blockUntil = now + duration
+        if (deactivateUser(userService, au)) {
+            blocks[uname] = [blockedUntil: blockUntil, reason: reason, since: now]
+            sendMail(mailServer, au.emailAddress, SUBJECT_BLOCK,
+"""Hello ${au.displayName},
+
+Your Jira account has been temporarily suspended due to excessive API usage.
+
+Reason: ${reason.replace('_',' ')}
+Block started: ${nowDate}
+Block ends:    ${new Date(blockUntil)}
+
+Your account will be automatically re-enabled after the block period.
+If you need assistance, contact the Jira administrators.
+
+Regards,
+Jira Admin Team
+""")
+        }
+    }
+}
+
+// Persist all
+writeMap(settings, key("counters"), counters)
+writeMap(settings, key("warnings"), warnings)
+writeMap(settings, key("blocks"),   blocks)
+writeMap(settings, nodeKey("offsets"), offsets)
+
+return "Node ${currentNodeId()}: ingested=${ingested}, users=${counters.size()}, blocked=${blocks.size()}"
