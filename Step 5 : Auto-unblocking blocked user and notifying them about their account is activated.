@@ -1,0 +1,101 @@
+Script B: Auto Unblock (Scheduled Job on one node)
+•	Go to Jira Admin settings
+•	Now select script runner
+•	Click on Jobs
+•	Click on create job
+•	Now select custom scheduled job
+•	Give name as WFH RL Auto Unblock
+•	Interval / corn expression (Schedule): 0 */5 * * * ? (every 5 minutes)
+•	 Now add the below script
+/**
+ * WFRL Auto-Unblock
+ * - Re-activates users whose block period has expired
+ * - Sends an "account re-enabled" email
+ * - Clears warning flags so the next breach will warn again
+ */
+
+import groovy.transform.Field
+import com.atlassian.jira.component.ComponentAccessor
+import com.atlassian.jira.user.ApplicationUser
+import com.atlassian.jira.bc.user.UserService
+import com.atlassian.crowd.embedded.impl.ImmutableUser
+import com.atlassian.jira.user.ApplicationUsers
+import com.atlassian.mail.Email
+import com.atlassian.mail.server.SMTPMailServer
+import com.atlassian.sal.api.pluginsettings.PluginSettingsFactory
+import com.atlassian.sal.api.pluginsettings.PluginSettings
+
+@Field final String NAMESPACE = "wfrl"
+@Field final String SUBJECT_UNBLOCK = "Your Jira account has been re-enabled"
+
+def userManager = ComponentAccessor.getUserManager()
+def userService = ComponentAccessor.getComponent(UserService)
+def mailServer  = ComponentAccessor.getMailServerManager()?.getDefaultSMTPMailServer() as SMTPMailServer
+def psf         = ComponentAccessor.getOSGiComponentInstanceOfType(PluginSettingsFactory)
+PluginSettings settings = psf.createGlobalSettings()
+
+String key(String s) { "${NAMESPACE}:${s}" }
+
+// helpers accept 'settings' to avoid scope errors
+Map readMap(PluginSettings settings, String k) { 
+    def raw = settings.get(k) as String
+    raw ? (new groovy.json.JsonSlurper().parseText(raw) as Map) : [:]
+}
+void writeMap(PluginSettings settings, String k, Map v) { 
+    settings.put(k, groovy.json.JsonOutput.toJson(v)) 
+}
+
+def blocks   = readMap(settings, key("blocks"))
+def warnings = readMap(settings, key("warnings"))
+def counters = readMap(settings, key("counters"))
+
+long now = System.currentTimeMillis()
+int unblocked = 0
+
+(blocks.keySet() as Set<String>).toList().each { uname ->
+    def b = blocks[uname] as Map; if (!b) return
+    long until = (b.blockedUntil as Long) ?: 0L
+    if (until > 0L && now >= until) {
+        def au = userManager.getUserByName(uname) as ApplicationUser
+        if (au) {
+            def immutable = new ImmutableUser(au.directoryId, au.name, au.displayName, au.emailAddress, true)
+            def updated   = ApplicationUsers.from(immutable)
+            def v = userService.validateUpdateUser(updated)
+            if (v.isValid()) {
+                userService.updateUser(v)
+                unblocked++
+                if (mailServer && au.emailAddress) {
+                    def email = new Email(au.emailAddress)
+                    email.setSubject(SUBJECT_UNBLOCK)
+                    email.setMimeType("text/plain; charset=UTF-8")
+                    email.setBody(
+"""Hello ${au.displayName},
+
+Your Jira account has been re-enabled after a temporary suspension.
+
+If you use scripts or integrations, please ensure they implement proper rate limiting and backoff on 429 responses.
+
+Regards,
+Jira Admin Team
+""")
+                    mailServer.send(email)
+                }
+            } else {
+                log.warn("Failed to re-activate ${uname}: ${v.errorCollection}")
+            }
+        }
+        // Cleanup
+        blocks.remove(uname)    // no longer blocked
+        warnings.remove(uname)  // reset warning flags so new breaches warn again
+        // counters kept; timestamps naturally expire from sliding windows
+    }
+}
+
+writeMap(settings, key("blocks"),   blocks)
+writeMap(settings, key("warnings"), warnings)
+writeMap(settings, key("counters"), counters)
+
+return "Unblocked ${unblocked} user(s)"
+
+•	Now click on Add
+•	This script can run on single node (Any one node is enough)
