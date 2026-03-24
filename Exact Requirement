@@ -1,0 +1,13 @@
+Exact Requirement
+•	10 minute window 
+o	At ≥500 requests → warning email
+o	At ≥700 requests → block for 1h + block email
+•	Hourly window 
+o	At ≥1000 requests → warning email
+o	At ≥2000 requests → block for 8h + block email
+•	Daily window 
+o	At ≥15000 requests → warning email
+o	At ≥20000 requests → block for 24h + block email
+•	Auto activation happens after 1h / 8h / 24h respectively, with an “account re enabled” email.
+•	Precedence ensures if hourly and 10 min thresholds are both exceeded at the same check, the 8 hour block is applied (and similar for daily).
+•	No double counting in a cluster: each node reads only its access log segment and maintains its own file offset; counters are centralized in plugin settings (DB backed).
