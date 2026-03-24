@@ -1,0 +1,17 @@
+How many days the access logs should be present in the file
+
+Log Retention (Important for Compliance) : By default, Jira does not rotate or delete access logs automatically.
+
+Configure the log retention
+•	Create a logrotate config
+•	sudo vi /etc/logrotate.d/jira-access
+/opt/atlassian/jira/logs/jira_access_log*.log {
+    daily
+    rotate 90		#this is retaining for 90days
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+•	Now to save the VI editor file press escape
+•	Now type :wq and press enter
