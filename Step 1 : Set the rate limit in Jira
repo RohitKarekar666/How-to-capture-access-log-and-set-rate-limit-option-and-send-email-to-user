@@ -1,0 +1,15 @@
+Follow these steps to set the rate limit
+•	Go to Jira admin setting
+•	Click on system
+•	Click on rate limit
+•	Now click on enable set below options
+•	Limit requests
+	Request allowed per node : 2000 per 1 hours per user
+	Max request : 2000
+•	Now click on save
+•	Now add exemption whom you do want to block
+•	Click on add exemption
+•	Select the user account or group
+•	Select allow unlimited requests
+•	Now click on add.
+•	If you want to block you have to just select Block all requests.
